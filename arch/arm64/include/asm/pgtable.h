@@ -931,7 +931,7 @@ static inline int __ptep_clear_flush_young(struct vm_area_struct *vma,
 {
 	int young = __ptep_test_and_clear_young(vma, address, ptep);
 
-	if (young) {
+	if (young && false) {
 		/*
 		 * We can elide the trailing DSB here since the worst that can
 		 * happen is that a CPU continues to use the young entry in its
