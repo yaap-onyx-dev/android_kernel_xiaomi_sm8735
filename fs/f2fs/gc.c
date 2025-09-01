@@ -2159,6 +2159,13 @@ int f2fs_gc_range(struct f2fs_sb_info *sbi,
 		if (!get_valid_blocks(sbi, segno, true))
 			goto next;
 
+		/*
+		 * avoid migrating empty section, as it can be allocated by
+		 * log in parallel.
+		 */
+		if (!get_valid_blocks(sbi, segno, true))
+			continue;
+
 		if (IS_CURSEC(sbi, GET_SEC_FROM_SEG(sbi, segno)))
 			goto next;
 
