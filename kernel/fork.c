@@ -2962,7 +2962,7 @@ pid_t kernel_clone(struct kernel_clone_args *args)
 		return -EINVAL;
 
 	/* Boost CPUs to the max for 50 ms when userspace launches an app */
-	if (task_is_zygote(current) && kp_active_mode() == 3)
+	if (task_is_zygote(current) && kp_active_mode() != 1)
 		cpu_boost_max(50);
 
 	/*
