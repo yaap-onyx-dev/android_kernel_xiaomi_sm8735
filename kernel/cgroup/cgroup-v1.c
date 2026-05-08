@@ -17,6 +17,7 @@
 #include <linux/fs_parser.h>
 #include <linux/binfmts.h>
 #include <linux/cpu_boost.h>
+#include <soc/qcom/dcvs_boost.h>
 
 #include <trace/events/cgroup.h>
 #include <trace/hooks/cgroup.h>
@@ -535,10 +536,12 @@ static ssize_t __cgroup1_procs_write(struct kernfs_open_file *of,
 		task_is_zygote(task->parent) && kp_active_mode() != 1) {
 		switch (kp_active_mode()) {
 		case 3:
-			cpu_boost_max(1500);
+			cpu_boost_max(2000);
+			qcom_dcvs_bus_boost_kick_max(3000);
 			break;
 		default:
-			cpu_boost_max(750);
+			cpu_boost_max(1000);
+			qcom_dcvs_bus_boost_kick_max(1500);
 			break;
 		}
 	}
