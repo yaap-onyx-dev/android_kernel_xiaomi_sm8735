@@ -520,6 +520,15 @@ config QCOM_STATS
 	  various SoC level low power modes statistics and export to debugfs
 	  interface.
 
+config QCOM_DCVS_BOOST_API
+	bool "QCOM DCVS boost API bridge"
+	depends on QCOM_DCVS
+	default y if QCOM_DCVS_BOOST
+	help
+	  Build the public qcom_dcvs_bus_boost_kick*() bridge into vmlinux
+	  so built-in code can call it even when the DCVS boost provider is
+	  a module. Calls are no-ops until a provider registers.
+
 config QCOM_LOGBUF_VENDOR_HOOKS
 	tristate "QTI Logbuf Vendor Hooks Support"
 	depends on ARCH_QCOM
