@@ -90,6 +90,11 @@ static __always_inline bool task_is_critical(void)
 	return READ_ONCE(current->signal->oom_score_adj) <= CRITICAL_OOM_SCORE_ADJ;
 }
 
+#include <linux/cpu_boost.h>
+#include <soc/qcom/dcvs_boost.h>
+
+extern int kp_active_mode(void);
+
 static HLIST_HEAD(binder_deferred_list);
 static DEFINE_MUTEX(binder_deferred_lock);
 
@@ -5902,6 +5907,20 @@ static int binder_ioctl_freeze(struct binder_freeze_info *info,
 	int ret = 0;
 
 	if (!info->enable) {
+		/* Boost for warm app transitions (unfreeze = app coming to foreground) */
+		if (kp_active_mode() != 1) {
+			switch (kp_active_mode()) {
+			case 3:
+				qcom_dcvs_bus_boost_kick_max(1000);
+				cpu_boost_max(1000);
+				break;
+			default:
+				qcom_dcvs_bus_boost_kick(1000);
+				cpu_boost_kick(1000);
+				break;
+			}
+		}
+
 		binder_inner_proc_lock(target_proc);
 		target_proc->sync_recv = false;
 		target_proc->async_recv = false;
