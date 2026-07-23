@@ -73,6 +73,19 @@
 EXPORT_TRACEPOINT_SYMBOL_GPL(mm_page_alloc);
 EXPORT_TRACEPOINT_SYMBOL_GPL(mm_page_free);
 
+#define CRITICAL_OOM_SCORE_ADJ	(-900)
+
+static __always_inline bool task_is_critical(void)
+{
+	if (current->flags & PF_KTHREAD)
+		return false;
+
+	if (unlikely(!current->signal))
+		return false;
+
+	return READ_ONCE(current->signal->oom_score_adj) <= CRITICAL_OOM_SCORE_ADJ;
+}
+
 /* Free Page Internal flags: for internal, non-pcp variants of free_pages(). */
 typedef int __bitwise fpi_t;
 
@@ -4259,6 +4272,8 @@ retry:
 		unreserve_highatomic_pageblock(ac, false);
 		trace_android_vh_drain_all_pages_bypass(gfp_mask, order,
 			alloc_flags, ac->migratetype, *did_some_progress, &skip_pcp_drain);
+		if (!skip_pcp_drain && task_is_critical())
+			skip_pcp_drain = true;
 		if (!skip_pcp_drain)
 			drain_all_pages(NULL);
 		drained = true;
@@ -4708,6 +4723,11 @@ retry:
 
 	if (page)
 		goto got_pg;
+
+	if (task_is_critical() && !(alloc_flags & ALLOC_MIN_RESERVE)) {
+		alloc_flags |= ALLOC_MIN_RESERVE;
+		goto retry;
+	}
 
 	if (direct_reclaim_retries < ULONG_MAX)
 		direct_reclaim_retries++;
