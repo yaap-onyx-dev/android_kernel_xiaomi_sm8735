@@ -165,12 +165,44 @@ void topology_set_freq_scale(const struct cpumask *cpus, unsigned long cur_freq,
 		per_cpu(arch_freq_scale, i) = scale;
 }
 
+/*
+ * The minimum frequency allowed by the cpufreq policy, expressed as a ratio of
+ * the maximum frequency (arch_min_freq_ratio) and as the capacity delivered at
+ * that frequency (arch_min_freq_scale). The ratio is kept around so that the
+ * capacity can be recomputed when the CPU capacities get renormalized, which
+ * happens after the policies of all CPUs have been created.
+ */
+static DEFINE_PER_CPU(unsigned long, arch_min_freq_ratio);
+DEFINE_PER_CPU(unsigned long, arch_min_freq_scale);
+EXPORT_PER_CPU_SYMBOL_GPL(arch_min_freq_scale);
+
 DEFINE_PER_CPU(unsigned long, cpu_scale) = SCHED_CAPACITY_SCALE;
 EXPORT_PER_CPU_SYMBOL_GPL(cpu_scale);
+
+void topology_set_min_freq_scale(const struct cpumask *cpus,
+				 unsigned long min_freq, unsigned long max_freq)
+{
+	unsigned long ratio;
+	int i;
+
+	if (WARN_ON_ONCE(!max_freq))
+		return;
+
+	ratio = (min(min_freq, max_freq) << SCHED_CAPACITY_SHIFT) / max_freq;
+
+	for_each_cpu(i, cpus) {
+		per_cpu(arch_min_freq_ratio, i) = ratio;
+		per_cpu(arch_min_freq_scale, i) =
+			(ratio * per_cpu(cpu_scale, i)) >> SCHED_CAPACITY_SHIFT;
+	}
+}
 
 void topology_set_cpu_scale(unsigned int cpu, unsigned long capacity)
 {
 	per_cpu(cpu_scale, cpu) = capacity;
+	per_cpu(arch_min_freq_scale, cpu) =
+		(per_cpu(arch_min_freq_ratio, cpu) * capacity) >>
+		SCHED_CAPACITY_SHIFT;
 }
 
 DEFINE_PER_CPU(unsigned long, thermal_pressure);

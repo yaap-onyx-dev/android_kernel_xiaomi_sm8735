@@ -2665,6 +2665,22 @@ unsigned long arch_scale_freq_capacity(int cpu)
 }
 #endif
 
+#ifndef arch_scale_min_freq_capacity
+/**
+ * arch_scale_min_freq_capacity - get the capacity of a CPU at its minimum
+ * allowed frequency.
+ * @cpu: the CPU in question.
+ *
+ * Return: the capacity @cpu delivers when running at the minimum frequency
+ * permitted by its cpufreq policy, or 0 when the architecture doesn't track it.
+ */
+static __always_inline
+unsigned long arch_scale_min_freq_capacity(int cpu)
+{
+	return 0;
+}
+#endif
+
 #ifdef CONFIG_SCHED_DEBUG
 /*
  * In double_lock_balance()/double_rq_lock(), we use raw_spin_rq_lock() to
