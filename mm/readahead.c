@@ -128,6 +128,7 @@
 #include <linux/blk-cgroup.h>
 #include <linux/fadvise.h>
 #include <linux/sched/mm.h>
+#include <linux/sched/signal.h>
 #include <trace/hooks/mm.h>
 
 #include "internal.h"
