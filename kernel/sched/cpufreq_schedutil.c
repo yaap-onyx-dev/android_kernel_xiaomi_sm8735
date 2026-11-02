@@ -10,9 +10,19 @@
 
 #define IOWAIT_BOOST_MIN	(SCHED_CAPACITY_SCALE / 8)
 
+/*
+ * Default DVFS headroom of each cluster, as a percentage of the capacity left
+ * above the actual utilization. CPUs 0-1 are the efficiency cluster, CPUs 2-6
+ * the performance clusters and CPU 7 the prime core.
+ */
+#define SUGOV_DVFS_HEADROOM_PCT_LITTLE	25
+#define SUGOV_DVFS_HEADROOM_PCT_MID	20
+#define SUGOV_DVFS_HEADROOM_PCT_PRIME	10
+
 struct sugov_tunables {
 	struct gov_attr_set	attr_set;
 	unsigned int		rate_limit_us;
+	unsigned int		dvfs_headroom_pct;
 };
 
 struct sugov_policy {
@@ -37,6 +47,9 @@ struct sugov_policy {
 
 	bool			limits_changed;
 	bool			need_freq_update;
+
+	/* Fraction of the spare capacity added as headroom, out of 1024 */
+	unsigned int		dvfs_headroom;
 };
 
 struct sugov_cpu {
@@ -326,12 +339,52 @@ static unsigned long sugov_effective_cpu_util(int cpu, unsigned long util_cfs,
 	return min(scale, util);
 }
 
-static unsigned long sugov_effective_cpu_perf(int cpu, unsigned long actual,
+static unsigned int sugov_default_dvfs_headroom_pct(unsigned int cpu)
+{
+	if (cpu <= 1)
+		return SUGOV_DVFS_HEADROOM_PCT_LITTLE;
+
+	if (cpu == 7)
+		return SUGOV_DVFS_HEADROOM_PCT_PRIME;
+
+	return SUGOV_DVFS_HEADROOM_PCT_MID;
+}
+
+static inline unsigned int sugov_dvfs_headroom_from_pct(unsigned int pct)
+{
+	return pct * SCHED_CAPACITY_SCALE / 100;
+}
+
+/*
+ * Tapered DVFS headroom: instead of scaling the utilization by a constant
+ * factor, add a fraction of the capacity that is left above it. The boost is
+ * large when a CPU is lightly loaded, which is when a quick ramp up matters,
+ * and fades out as the utilization approaches the CPU's capacity, where the
+ * OPPs are the most expensive and not much margin is needed anymore.
+ *
+ * The capacity is read on every call rather than cached, since the CPU
+ * capacities are only normalized once all the cpufreq policies exist.
+ */
+static inline unsigned long sugov_apply_dvfs_headroom(unsigned long util,
+						      int cpu,
+						      unsigned int headroom)
+{
+	unsigned long capacity = arch_scale_cpu_capacity(cpu);
+
+	if (util >= capacity)
+		return util;
+
+	return util + (((capacity - util) * headroom) >> SCHED_CAPACITY_SHIFT);
+}
+
+static unsigned long sugov_effective_cpu_perf(struct sugov_cpu *sg_cpu,
+					      unsigned long actual,
 					      unsigned long min,
 					      unsigned long max)
 {
 	/* Add dvfs headroom to actual utilization */
-	actual = map_util_perf(actual);
+	actual = sugov_apply_dvfs_headroom(actual, sg_cpu->cpu,
+				READ_ONCE(sg_cpu->sg_policy->dvfs_headroom));
 	/* Actually we don't need to target the max performance */
 	if (actual < max)
 		max = actual;
@@ -350,7 +403,7 @@ static void sugov_get_util(struct sugov_cpu *sg_cpu, unsigned long boost)
 	util = sugov_effective_cpu_util(sg_cpu->cpu, util, &min, &max);
 	util = max(util, boost);
 	sg_cpu->bw_min = min;
-	sg_cpu->util = sugov_effective_cpu_perf(sg_cpu->cpu, util, min, max);
+	sg_cpu->util = sugov_effective_cpu_perf(sg_cpu, util, min, max);
 }
 
 /**
@@ -684,8 +737,37 @@ rate_limit_us_store(struct gov_attr_set *attr_set, const char *buf, size_t count
 
 static struct governor_attr rate_limit_us = __ATTR_RW(rate_limit_us);
 
+static ssize_t dvfs_headroom_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
+
+	return sysfs_emit(buf, "%u\n", tunables->dvfs_headroom_pct);
+}
+
+static ssize_t dvfs_headroom_pct_store(struct gov_attr_set *attr_set,
+				       const char *buf, size_t count)
+{
+	struct sugov_tunables *tunables = to_sugov_tunables(attr_set);
+	struct sugov_policy *sg_policy;
+	unsigned int pct;
+
+	if (kstrtouint(buf, 10, &pct) || pct > 100)
+		return -EINVAL;
+
+	tunables->dvfs_headroom_pct = pct;
+
+	list_for_each_entry(sg_policy, &attr_set->policy_list, tunables_hook)
+		WRITE_ONCE(sg_policy->dvfs_headroom,
+			   sugov_dvfs_headroom_from_pct(pct));
+
+	return count;
+}
+
+static struct governor_attr dvfs_headroom_pct = __ATTR_RW(dvfs_headroom_pct);
+
 static struct attribute *sugov_attrs[] = {
 	&rate_limit_us.attr,
+	&dvfs_headroom_pct.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(sugov);
@@ -853,6 +935,7 @@ static int sugov_init(struct cpufreq_policy *policy)
 	}
 
 	tunables->rate_limit_us = 2000;
+	tunables->dvfs_headroom_pct = sugov_default_dvfs_headroom_pct(policy->cpu);
 
 	policy->governor_data = sg_policy;
 	sg_policy->tunables = tunables;
@@ -913,6 +996,8 @@ static int sugov_start(struct cpufreq_policy *policy)
 	unsigned int cpu;
 
 	sg_policy->freq_update_delay_ns	= sg_policy->tunables->rate_limit_us * NSEC_PER_USEC;
+	sg_policy->dvfs_headroom	=
+		sugov_dvfs_headroom_from_pct(sg_policy->tunables->dvfs_headroom_pct);
 	sg_policy->last_freq_update_time	= 0;
 	sg_policy->next_freq			= 0;
 	sg_policy->work_in_progress		= false;
