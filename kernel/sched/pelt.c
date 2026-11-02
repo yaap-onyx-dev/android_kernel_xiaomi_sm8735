@@ -220,11 +220,11 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
 	 * Now we know we crossed measurement unit boundaries. The *_avg
 	 * accrues by two steps:
 	 *
-	 * Step 1: accumulate *_sum since last_update_time. If we haven't
-	 * crossed period boundaries, finish.
+	 * Step 1: accumulate *_sum since last_update_time. The *_avg are
+	 * refreshed even when no period boundary was crossed, so that the
+	 * values seen at dequeue don't depend on when the last tick happened.
 	 */
-	if (!accumulate_sum(delta, sa, load, runnable, running))
-		return 0;
+	accumulate_sum(delta, sa, load, runnable, running);
 
 	return 1;
 }
