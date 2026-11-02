@@ -41,6 +41,7 @@
 #include <linux/context_tracking.h>
 #include <linux/cpuset.h>
 #include <linux/delayacct.h>
+#include <linux/fie.h>
 #include <linux/init_task.h>
 #include <linux/interrupt.h>
 #include <linux/ioprio.h>
@@ -786,6 +787,7 @@ void update_rq_clock(struct rq *rq)
 	delta = sched_clock_cpu(cpu_of(rq)) - rq->clock;
 	if (delta < 0)
 		return;
+	fie_update_rq_clock(rq);
 	rq->clock += delta;
 	update_rq_clock_task(rq, delta);
 }

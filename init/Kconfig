@@ -1326,6 +1326,24 @@ config SCHED_CASS
 	  is not meant to be used together with a vendor scheduler that hooks
 	  task placement, such as QTI WALT.
 
+config SCHED_FIE
+	bool "Frequency Invariance Engine"
+	depends on ARM64 && SMP && !CPU_BIG_ENDIAN
+	depends on ARM_PMUV3 && CPU_IDLE && ANDROID_VENDOR_HOOKS
+	depends on GENERIC_ARCH_TOPOLOGY
+	depends on SCHED_WALT=n
+	help
+	  This enables the Frequency Invariance Engine (FIE), which measures
+	  the real frequency of every CPU with the AMU (or PMU) cycle counters
+	  right before the scheduler updates its load tracking, instead of
+	  assuming that the frequency last requested from cpufreq is the one
+	  the hardware is running at.
+
+	  It also detects when the hardware doesn't deliver the requested
+	  frequency (firmware throttling or a slow transition) and reports it
+	  to the scheduler as thermal pressure, together with the throttling
+	  reported by the cpufreq driver.
+
 config SCHED_AUTOGROUP
 	bool "Automatic process group scheduling"
 	select CGROUPS
