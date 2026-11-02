@@ -801,6 +801,7 @@ static int init_events_group(void)
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_SCHED_WALT)
 static void nr_notify_userspace(struct work_struct *work)
 {
 	sysfs_notify(notify_kobj, NULL, "aggr_top_load");
@@ -808,11 +809,13 @@ static void nr_notify_userspace(struct work_struct *work)
 	sysfs_notify(notify_kobj, NULL, "top_load_cluster");
 	sysfs_notify(notify_kobj, NULL, "curr_cap_cluster");
 }
+#endif
 
 static int msm_perf_core_ctl_notify(struct notifier_block *nb,
 					unsigned long unused,
 					void *data)
 {
+#if IS_ENABLED(CONFIG_SCHED_WALT)
 	static DECLARE_WORK(sysfs_notify_work, nr_notify_userspace);
 	struct core_ctl_notif_data *d = data;
 	int cluster = 0;
@@ -825,6 +828,7 @@ static int msm_perf_core_ctl_notify(struct notifier_block *nb,
 	aggr_big_nr = d->nr_big;
 
 	schedule_work(&sysfs_notify_work);
+#endif
 	return NOTIFY_OK;
 }
 

@@ -17,6 +17,7 @@ config QTI_MPAM
 config QTI_CPU_MPAM_INTERFACE
 	tristate "Enable QCOM CPU MPAM configfs support"
 	depends on QTI_MPAM && CONFIGFS_FS
+	depends on SCHED_WALT
 	default n
 	help
 	  This enables QCOM CPU MPAM configfs interface support. User

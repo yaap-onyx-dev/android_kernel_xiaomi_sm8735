@@ -989,6 +989,7 @@ config MINIDUMP_MAX_ENTRIES
 config QCOM_HUNG_TASK_ENH
         tristate "QTI Hung Task Enhancement"
         depends on ARCH_QCOM
+        depends on SCHED_WALT
         help
           Add options at sysfs to enhance khungtask, allow user to
           select and monitor tasks in black/white list mode. Also
