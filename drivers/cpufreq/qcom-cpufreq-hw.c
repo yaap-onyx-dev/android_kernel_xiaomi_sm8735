@@ -18,6 +18,7 @@
 #include <linux/spinlock.h>
 #include <linux/qcom-cpufreq-hw.h>
 #include <linux/topology.h>
+#include <linux/fie.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/dcvsh.h>
@@ -195,6 +196,7 @@ static int qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 	struct qcom_cpufreq_data *data = policy->driver_data;
 	const struct qcom_cpufreq_soc_data *soc_data = data->soc_data;
 	unsigned long freq = policy->freq_table[index].frequency;
+	unsigned long flags;
 	unsigned int i;
 
 	if (soc_data->perf_lock_support) {
@@ -202,7 +204,14 @@ static int qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 			writel_relaxed(index, data->pdmem_base);
 	}
 
+	/*
+	 * Disable IRQs around the frequency set so that the timestamp
+	 * recorded by FIE is as close to the actual MMIO write as possible.
+	 */
+	local_irq_save(flags);
 	writel_relaxed(index, data->base + soc_data->reg_perf_state);
+	fie_rate_set(policy->cpu, freq);
+	local_irq_restore(flags);
 
 	if (data->per_core_dcvs)
 		for (i = 1; i < cpumask_weight(policy->related_cpus); i++)
@@ -279,6 +288,8 @@ static unsigned int qcom_cpufreq_hw_fast_switch(struct cpufreq_policy *policy,
 	if (data->per_core_dcvs)
 		for (i = 1; i < cpumask_weight(policy->related_cpus); i++)
 			writel_relaxed(index, data->base + soc_data->reg_perf_state + i * 4);
+
+	fie_rate_set(policy->cpu, policy->freq_table[index].frequency);
 
 	return policy->freq_table[index].frequency;
 }
@@ -488,8 +499,16 @@ static void qcom_lmh_dcvs_notify(struct qcom_cpufreq_data *data)
 
 	trace_dcvsh_freq(cpu, qcom_cpufreq_get_freq(policy), throttled_freq, thermal_pressure);
 
-	/* Update thermal pressure (the boost frequencies are accepted) */
-	arch_update_thermal_pressure(policy->related_cpus, thermal_pressure);
+	/*
+	 * Route the LMh throttled frequency through FIE, which combines it
+	 * with the throttling it measures itself. Without FIE, update the
+	 * thermal pressure directly (the boost frequencies are accepted).
+	 */
+	if (!fie_cpufreq_pressure(cpu,
+				  thermal_pressure >= policy->cpuinfo.max_freq ?
+				  UINT_MAX : thermal_pressure))
+		arch_update_thermal_pressure(policy->related_cpus,
+					     thermal_pressure);
 	data->dcvsh_freq_limit = thermal_pressure;
 
 out:
@@ -653,7 +672,8 @@ static int qcom_cpufreq_hw_cpu_offline(struct cpufreq_policy *policy)
 	irq_set_affinity_and_hint(data->throttle_irq, NULL);
 	disable_irq_nosync(data->throttle_irq);
 
-	arch_update_thermal_pressure(policy->related_cpus, U32_MAX);
+	if (!fie_cpufreq_pressure(policy->cpu, UINT_MAX))
+		arch_update_thermal_pressure(policy->related_cpus, U32_MAX);
 	trace_dcvsh_throttle(cpumask_first(policy->related_cpus), 0);
 
 	return 0;
@@ -678,7 +698,8 @@ static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
 	void __iomem *base;
 	struct qcom_cpufreq_data *data;
 	char pdmem_name[MAX_FN_SIZE] = {};
-	int ret, index;
+	unsigned int max_freq;
+	int ret, index, i;
 
 	cpu_dev = get_cpu_device(policy->cpu);
 	if (!cpu_dev) {
@@ -776,6 +797,19 @@ static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
 		else
 			data->pdmem_base = base;
 	}
+
+	/*
+	 * Register this frequency domain with FIE now that the freq table is
+	 * populated. Scan the table for the max frequency since cpuinfo.max_freq
+	 * isn't set until after cpu_init returns.
+	 */
+	max_freq = 0;
+	for (i = 0; policy->freq_table[i].frequency != CPUFREQ_TABLE_END; i++) {
+		if (policy->freq_table[i].frequency != CPUFREQ_ENTRY_INVALID &&
+		    policy->freq_table[i].frequency > max_freq)
+			max_freq = policy->freq_table[i].frequency;
+	}
+	fie_init_cpu_domain(policy->cpus, max_freq);
 
 	ret = dev_pm_opp_get_opp_count(cpu_dev);
 	if (ret <= 0) {
