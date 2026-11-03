@@ -27,6 +27,9 @@
 #include <linux/mutex.h>
 #include <linux/cpu.h>
 #include <linux/spinlock.h>
+#include <linux/kthread.h>
+#include <linux/freezer.h>
+#include <linux/wait.h>
 #include <trace/hooks/sched.h>
 #include <soc/qcom/dcvs.h>
 #include <soc/qcom/pmu_lib.h>
@@ -149,21 +152,118 @@ struct cpu_ctrs {
 	u64				grp_ctrs[MAX_MEMLAT_GRPS][NUM_GRP_EVS];
 };
 
-struct cpu_stats {
-	struct cpu_ctrs			prev;
-	struct cpu_ctrs			curr;
-	struct cpu_ctrs			delta;
-	struct qcom_pmu_data		raw_ctrs;
+/* One published sample of a CPU's counters */
+struct cpu_snap {
+	struct cpu_ctrs			ctrs;
 	bool				idle_sample;
 	ktime_t				sample_ts;
-	ktime_t				last_sample_ts;
-	spinlock_t			ctrs_lock;
+};
+
+/*
+ * Each CPU publishes its samples to the sampling thread through two snapshot
+ * buffers, without a lock. The producer is always the CPU itself, from its
+ * scheduler tick or its idle entry, with IRQs disabled; the consumer is the
+ * memlat kthread. cur_ptr[] holds the buffers that nobody owns right now:
+ * cur_ptr[0] is the latest published sample (if any) and cur_ptr[1] is the
+ * spare. A NULL slot means that buffer is owned by the producer or consumer.
+ * Both slots are swapped together with a 128-bit cmpxchg, so each side
+ * always takes ownership of a buffer that the other side isn't using.
+ */
+union snap_ptrs {
+	struct cpu_snap			*p[2];
+	u128				v;
+};
+
+struct cpu_stats {
+	union snap_ptrs			cur_ptr __aligned(16);
+	struct cpu_snap			cur[2];
+	/* Producer-only state */
+	struct cpu_ctrs			wr_ctrs;
+	struct qcom_pmu_data		raw_ctrs;
+	ktime_t				prod_ts;
+	/* Consumer-only state */
+	struct cpu_ctrs			prev;
+	struct cpu_ctrs			delta;
+	ktime_t				cons_ts;
 	u32				freq_mhz;
 	u32				fe_stall_pct;
 	u32				be_stall_pct;
 	u32				ipm[MAX_MEMLAT_GRPS];
 	u32				wb_pct[MAX_MEMLAT_GRPS];
 };
+
+static __always_inline union snap_ptrs snap_read_ptrs(struct cpu_stats *stats)
+{
+	union snap_ptrs old;
+
+	/* A torn read is fine, the cmpxchg will just fail and retry */
+	old.p[0] = READ_ONCE(stats->cur_ptr.p[0]);
+	old.p[1] = READ_ONCE(stats->cur_ptr.p[1]);
+	return old;
+}
+
+static __always_inline bool snap_swap_ptrs(struct cpu_stats *stats,
+					   union snap_ptrs old,
+					   union snap_ptrs new)
+{
+	return cmpxchg128_local(&stats->cur_ptr.v, old.v, new.v) == old.v;
+}
+
+/* Consumer: take the latest sample, leaving the other buffer as the spare */
+static struct cpu_snap *snap_get_reader(struct cpu_stats *stats)
+{
+	union snap_ptrs old, new;
+
+	do {
+		old = snap_read_ptrs(stats);
+		new.p[0] = NULL;
+		new.p[1] = old.p[0] ? old.p[1] : NULL;
+	} while (!snap_swap_ptrs(stats, old, new));
+
+	return old.p[0] ? old.p[0] : old.p[1];
+}
+
+/* Consumer: give the buffer back as the spare, or as the latest if unchanged */
+static void snap_put_reader(struct cpu_stats *stats, struct cpu_snap *snap)
+{
+	union snap_ptrs old, new;
+
+	/* Finish reading the buffer before the producer can reuse it */
+	smp_mb();
+	do {
+		old = snap_read_ptrs(stats);
+		new.p[0] = old.p[1] ? snap : old.p[0];
+		new.p[1] = old.p[1] ? old.p[1] : snap;
+	} while (!snap_swap_ptrs(stats, old, new));
+}
+
+/* Producer: take the spare, or the latest if the consumer holds the spare */
+static struct cpu_snap *snap_get_writer(struct cpu_stats *stats)
+{
+	union snap_ptrs old, new;
+
+	do {
+		old = snap_read_ptrs(stats);
+		new.p[0] = old.p[1] ? old.p[0] : NULL;
+		new.p[1] = NULL;
+	} while (!snap_swap_ptrs(stats, old, new));
+
+	return old.p[1] ? old.p[1] : old.p[0];
+}
+
+/* Producer: publish the buffer as the latest sample */
+static void snap_put_writer(struct cpu_stats *stats, struct cpu_snap *snap)
+{
+	union snap_ptrs old, new;
+
+	/* Make the sample visible before the buffer is published */
+	smp_wmb();
+	do {
+		old = snap_read_ptrs(stats);
+		new.p[0] = snap;
+		new.p[1] = old.p[0] ? old.p[0] : old.p[1];
+	} while (!snap_swap_ptrs(stats, old, new));
+}
 
 struct cpufreq_memfreq_map {
 	unsigned int			cpufreq_mhz;
@@ -224,8 +324,9 @@ struct memlat_dev_data {
 	struct device			*dev;
 	struct kobject			kobj;
 	u32				common_ev_ids[NUM_COMMON_EVS];
-	struct work_struct		work;
-	struct workqueue_struct		*memlat_wq;
+	struct task_struct		*task;
+	wait_queue_head_t		waitq;
+	atomic_t			kick;
 	u32				sample_ms;
 	struct hrtimer			timer;
 	ktime_t				last_update_ts;
@@ -829,9 +930,9 @@ out:
 
 static void calculate_sampling_stats(void)
 {
-	int i, grp, cpu, level = 0;
-	unsigned long flags;
+	int i, grp, cpu;
 	struct cpu_stats *stats;
+	struct cpu_snap *snap;
 	struct cpu_ctrs *delta;
 	struct memlat_group *memlat_grp;
 	ktime_t now = ktime_get();
@@ -840,32 +941,23 @@ static void calculate_sampling_stats(void)
 	update_us = ktime_us_delta(now, memlat_data->last_update_ts);
 	memlat_data->last_update_ts = now;
 
-	local_irq_save(flags);
-	for_each_possible_cpu(cpu) {
-		stats = per_cpu(sampling_stats, cpu);
-		if (level == 0)
-			spin_lock(&stats->ctrs_lock);
-		else
-			spin_lock_nested(&stats->ctrs_lock, level);
-		level++;
-	}
-
 	for_each_possible_cpu(cpu) {
 		stats = per_cpu(sampling_stats, cpu);
 		delta = &stats->delta;
+		snap = snap_get_reader(stats);
 		/* use update_us and now to synchronize idle cpus */
-		if (stats->idle_sample) {
+		if (snap->idle_sample) {
 			delta_us = update_us;
-			stats->last_sample_ts = now;
+			stats->cons_ts = now;
 		} else {
-			delta_us = ktime_us_delta(stats->sample_ts,
-							stats->last_sample_ts);
-			stats->last_sample_ts = stats->sample_ts;
+			delta_us = ktime_us_delta(snap->sample_ts,
+						  stats->cons_ts);
+			stats->cons_ts = snap->sample_ts;
 		}
 		for (i = 0; i < NUM_COMMON_EVS; i++) {
 			if (!memlat_data->common_ev_ids[i])
 				continue;
-			delta->common_ctrs[i] = stats->curr.common_ctrs[i] -
+			delta->common_ctrs[i] = snap->ctrs.common_ctrs[i] -
 						stats->prev.common_ctrs[i];
 		}
 
@@ -877,12 +969,13 @@ static void calculate_sampling_stats(void)
 				if (!memlat_grp->grp_ev_ids[i])
 					continue;
 				delta->grp_ctrs[grp][i] =
-					    stats->curr.grp_ctrs[grp][i] -
+					    snap->ctrs.grp_ctrs[grp][i] -
 					    stats->prev.grp_ctrs[grp][i];
 			}
 		}
 
-		stats->freq_mhz = delta->common_ctrs[CYC_IDX] / delta_us;
+		stats->freq_mhz = delta_us > 0 ?
+			div64_u64(delta->common_ctrs[CYC_IDX], delta_us) : 0;
 		if (!memlat_data->common_ev_ids[FE_STALL_IDX])
 			stats->fe_stall_pct = 100;
 		else
@@ -924,14 +1017,9 @@ static void calculate_sampling_stats(void)
 					stats->fe_stall_pct);
 
 		}
-		memcpy(&stats->prev, &stats->curr, sizeof(stats->curr));
+		memcpy(&stats->prev, &snap->ctrs, sizeof(stats->prev));
+		snap_put_reader(stats, snap);
 	}
-
-	for_each_possible_cpu(cpu) {
-		stats = per_cpu(sampling_stats, cpu);
-		spin_unlock(&stats->ctrs_lock);
-	}
-	local_irq_restore(flags);
 }
 
 static inline void set_higher_freq(int *max_cpu, int cpu, u32 *max_cpufreq,
@@ -1077,7 +1165,7 @@ static void update_memlat_fp_vote(int cpu, u32 *fp_freqs)
 }
 
 /* sampling path update work */
-static void memlat_update_work(struct work_struct *work)
+static void memlat_update_work(void)
 {
 	int i, grp, ret;
 	struct memlat_group *memlat_grp;
@@ -1124,10 +1212,28 @@ static void memlat_update_work(struct work_struct *work)
 	}
 }
 
+static int memlat_thread(void *data)
+{
+	set_freezable();
+
+	while (!kthread_should_stop()) {
+		wait_event_freezable(memlat_data->waitq,
+				     atomic_read(&memlat_data->kick) ||
+				     kthread_should_stop());
+		if (!atomic_xchg(&memlat_data->kick, 0))
+			continue;
+
+		calculate_sampling_stats();
+		memlat_update_work();
+	}
+
+	return 0;
+}
+
 static enum hrtimer_restart memlat_hrtimer_handler(struct hrtimer *timer)
 {
-	calculate_sampling_stats();
-	queue_work(memlat_data->memlat_wq, &memlat_data->work);
+	if (!atomic_xchg(&memlat_data->kick, 1))
+		wake_up(&memlat_data->waitq);
 
 	return HRTIMER_NORESTART;
 }
@@ -1150,13 +1256,13 @@ static void memlat_jiffies_update_cb(void *unused, void *extra)
 }
 
 /*
- * Note: must hold stats->ctrs_lock and populate stats->raw_ctrs
- * before calling this API.
+ * Note: must run on the CPU that owns @stats with IRQs disabled, after
+ * populating stats->raw_ctrs.
  */
 static void process_raw_ctrs(struct cpu_stats *stats)
 {
 	int i, grp, idx;
-	struct cpu_ctrs *curr_ctrs = &stats->curr;
+	struct cpu_ctrs *curr_ctrs = &stats->wr_ctrs;
 	struct qcom_pmu_data *raw_ctrs = &stats->raw_ctrs;
 	struct memlat_group *memlat_grp;
 	u32 event_id;
@@ -1191,6 +1297,18 @@ static void process_raw_ctrs(struct cpu_stats *stats)
 	}
 }
 
+/* Must run on the CPU that owns @stats with IRQs disabled */
+static void memlat_publish_sample(struct cpu_stats *stats, bool idle,
+				  ktime_t ts)
+{
+	struct cpu_snap *snap = snap_get_writer(stats);
+
+	memcpy(&snap->ctrs, &stats->wr_ctrs, sizeof(snap->ctrs));
+	snap->idle_sample = idle;
+	snap->sample_ts = ts;
+	snap_put_writer(stats, snap);
+}
+
 static void memlat_pmu_idle_cb(struct qcom_pmu_data *data, int cpu, int state)
 {
 	struct cpu_stats *stats = per_cpu(sampling_stats, cpu);
@@ -1199,11 +1317,11 @@ static void memlat_pmu_idle_cb(struct qcom_pmu_data *data, int cpu, int state)
 	if (unlikely(!memlat_data->inited))
 		return;
 
-	spin_lock_irqsave(&stats->ctrs_lock, flags);
+	local_irq_save(flags);
 	memcpy(&stats->raw_ctrs, data, sizeof(*data));
 	process_raw_ctrs(stats);
-	stats->idle_sample = true;
-	spin_unlock_irqrestore(&stats->ctrs_lock, flags);
+	memlat_publish_sample(stats, true, 0);
+	local_irq_restore(flags);
 }
 
 static struct qcom_pmu_notif_node memlat_idle_notif = {
@@ -1221,12 +1339,10 @@ static void memlat_sched_tick_cb(void *unused, struct rq *rq)
 	if (unlikely(!memlat_data->inited))
 		return;
 
-	spin_lock_irqsave(&stats->ctrs_lock, flags);
-	delta_ns = now - stats->last_sample_ts + HALF_TICK_NS;
+	local_irq_save(flags);
+	delta_ns = now - stats->prod_ts + HALF_TICK_NS;
 	if (delta_ns < ms_to_ktime(memlat_data->sample_ms))
 		goto out;
-	stats->sample_ts = now;
-	stats->idle_sample = false;
 	stats->raw_ctrs.num_evs = 0;
 	ret = qcom_pmu_read_all_local(&stats->raw_ctrs);
 	if (ret < 0 || stats->raw_ctrs.num_evs == 0) {
@@ -1234,9 +1350,11 @@ static void memlat_sched_tick_cb(void *unused, struct rq *rq)
 		goto out;
 	}
 	process_raw_ctrs(stats);
+	memlat_publish_sample(stats, false, now);
+	stats->prod_ts = now;
 
 out:
-	spin_unlock_irqrestore(&stats->ctrs_lock, flags);
+	local_irq_restore(flags);
 }
 
 static int get_mask_and_mpidr_from_pdev(struct platform_device *pdev,
@@ -1338,16 +1456,22 @@ static int memlat_sampling_init(void)
 		stats = devm_kzalloc(dev, sizeof(*stats), GFP_KERNEL);
 		if (!stats)
 			return -ENOMEM;
+		/* The 128-bit cmpxchg needs a 16-byte aligned operand */
+		if (WARN_ON(!IS_ALIGNED((unsigned long)&stats->cur_ptr, 16)))
+			return -EINVAL;
+		stats->cur_ptr.p[0] = &stats->cur[0];
+		stats->cur_ptr.p[1] = &stats->cur[1];
 		per_cpu(sampling_stats, cpu) = stats;
-		spin_lock_init(&stats->ctrs_lock);
 	}
 
-	memlat_data->memlat_wq = create_freezable_workqueue("memlat_wq");
-	if (!memlat_data->memlat_wq) {
-		dev_err(dev, "Couldn't create memlat workqueue.\n");
-		return -ENOMEM;
+	init_waitqueue_head(&memlat_data->waitq);
+	atomic_set(&memlat_data->kick, 0);
+	memlat_data->task = kthread_run(memlat_thread, NULL, "memlat");
+	if (IS_ERR(memlat_data->task)) {
+		dev_err(dev, "Couldn't create memlat thread: %ld\n",
+			PTR_ERR(memlat_data->task));
+		return PTR_ERR(memlat_data->task);
 	}
-	INIT_WORK(&memlat_data->work, &memlat_update_work);
 
 	hrtimer_init(&memlat_data->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	memlat_data->timer.function = memlat_hrtimer_handler;
