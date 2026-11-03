@@ -985,8 +985,13 @@ else
 CC_FLAGS_LTO	+= -fvisibility=default
 endif
 
-# Limit inlining across translation units to reduce binary size
+# Limit inlining across translation units to reduce binary size. With AutoFDO
+# the profile tells the compiler which calls are hot, so allow more of them.
+ifdef CONFIG_AUTOFDO_CLANG
+KBUILD_LDFLAGS += -mllvm -import-instr-limit=40
+else
 KBUILD_LDFLAGS += -mllvm -import-instr-limit=5
+endif
 
 # Check for frame size exceeding threshold during prolog/epilog insertion
 # when using lld < 13.0.0.
@@ -1052,6 +1057,11 @@ include-$(CONFIG_UBSAN)		+= scripts/Makefile.ubsan
 include-$(CONFIG_KCOV)		+= scripts/Makefile.kcov
 include-$(CONFIG_RANDSTRUCT)	+= scripts/Makefile.randstruct
 include-$(CONFIG_AUTOFDO_CLANG)	+= scripts/Makefile.autofdo
+# Default to the profile shipped with the common kernel when the build doesn't
+# pass one (the Android platform build doesn't).
+ifdef CONFIG_AUTOFDO_CLANG
+CLANG_AUTOFDO_PROFILE ?= $(srctree)/android/gki/aarch64/afdo/kernel.afdo
+endif
 include-$(CONFIG_GCC_PLUGINS)	+= scripts/Makefile.gcc-plugins
 
 include $(addprefix $(srctree)/, $(include-y))
