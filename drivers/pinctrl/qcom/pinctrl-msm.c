@@ -1395,6 +1395,14 @@ static int msm_gpio_irq_set_affinity(struct irq_data *d,
 	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
 	struct msm_pinctrl *pctrl = gpiochip_get_data(gc);
 
+	/*
+	 * Keep GPIO IRQs where they were requested when SBalance is enabled.
+	 * Moving the wakeup-capable ones means reprogramming their route
+	 * through the PDC, which SBalance would otherwise do every few seconds.
+	 */
+	if (IS_ENABLED(CONFIG_IRQ_SBALANCE))
+		return -EINVAL;
+
 	if (d->parent_data && test_bit(d->hwirq, pctrl->skip_wake_irqs))
 		return irq_chip_set_affinity_parent(d, dest, force);
 
