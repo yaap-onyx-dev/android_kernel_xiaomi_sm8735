@@ -29,6 +29,7 @@ static DECLARE_BITMAP(pending_max_enable, NR_CPUS);
 static DECLARE_BITMAP(pending_kick_enable, NR_CPUS);
 
 static atomic_long_t boost_expires = ATOMIC_LONG_INIT(0);
+static atomic_long_t boost_max_expires = ATOMIC_LONG_INIT(INITIAL_JIFFIES);
 
 static struct delayed_work boost_disable_work;
 
@@ -233,6 +234,7 @@ void cpu_boost_max(unsigned int duration_ms)
 	unsigned long new_exp = now + msecs_to_jiffies(duration_ms);
 	unsigned long old = atomic_long_read(&boost_expires);
 	unsigned long flags;
+	long max_exp;
 
 	for (;;) {
 		if (time_after(old, new_exp))
@@ -242,12 +244,25 @@ void cpu_boost_max(unsigned int duration_ms)
 			break;
 	}
 
+	max_exp = atomic_long_read(&boost_max_expires);
+	do {
+		if (!time_after(new_exp, (unsigned long)max_exp))
+			break;
+	} while (!atomic_long_try_cmpxchg(&boost_max_expires, &max_exp, new_exp));
+
 	mod_delayed_work(system_unbound_wq, &boost_disable_work, 0);
 	spin_lock_irqsave(&pending_lock, flags);
 	bitmap_fill(pending_max_enable, NR_CPUS);
 	spin_unlock_irqrestore(&pending_lock, flags);
 }
 EXPORT_SYMBOL_GPL(cpu_boost_max);
+
+/* Whether a max boost (app launch, fork burst) is in effect */
+bool cpu_boost_max_active(void)
+{
+	return time_before(jiffies, (unsigned long)atomic_long_read(&boost_max_expires));
+}
+EXPORT_SYMBOL_GPL(cpu_boost_max_active);
 
 void cpu_boost_kick(unsigned int duration_ms)
 {
