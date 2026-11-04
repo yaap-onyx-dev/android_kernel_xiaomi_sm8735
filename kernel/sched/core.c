@@ -9779,11 +9779,9 @@ struct task_struct *pick_migrate_task(struct rq *rq)
 	struct task_struct *next;
 
 	for_each_class(class) {
-		next = class->pick_next_task(rq);
-		if (next) {
-			next->sched_class->put_prev_task(rq, next);
+		next = class->pick_task(rq);
+		if (next)
 			return next;
-		}
 	}
 
 	/* The idle class should always have a runnable task */
