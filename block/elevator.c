@@ -576,6 +576,15 @@ static struct elevator_type *elevator_get_default(struct request_queue *q)
 	    !blk_mq_is_shared_tags(q->tag_set->flags))
 		return NULL;
 
+#if IS_BUILTIN(CONFIG_MQ_IOSCHED_SSG)
+	{
+		struct elevator_type *e = elevator_find_get(q, "ssg");
+
+		if (e)
+			return e;
+	}
+#endif
+
 	return elevator_find_get(q, "mq-deadline");
 }
 
