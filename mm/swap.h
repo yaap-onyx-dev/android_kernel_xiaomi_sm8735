@@ -18,6 +18,8 @@ static inline void swap_read_unplug(struct swap_iocb *plug)
 void swap_write_unplug(struct swap_iocb *sio);
 int swap_writepage(struct page *page, struct writeback_control *wbc);
 void __swap_writepage(struct page *page, struct writeback_control *wbc);
+void kcompressd_run(int nid);
+void kcompressd_stop(int nid);
 
 /* linux/mm/swap_state.c */
 /* One swap address space for each 64M swap space */
@@ -62,6 +64,14 @@ static inline unsigned int folio_swap_flags(struct folio *folio)
 	return page_swap_info(&folio->page)->flags;
 }
 #else /* CONFIG_SWAP */
+static inline void kcompressd_run(int nid)
+{
+}
+
+static inline void kcompressd_stop(int nid)
+{
+}
+
 struct swap_iocb;
 static inline void swap_readpage(struct page *page, bool do_poll,
 		struct swap_iocb **plug)

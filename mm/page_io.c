@@ -25,6 +25,10 @@
 #include <linux/sched/task.h>
 #include <linux/delayacct.h>
 #include <linux/zswap.h>
+#include <linux/kfifo.h>
+#include <linux/kthread.h>
+#include <linux/sched/mm.h>
+#include <linux/sysctl.h>
 #include "swap.h"
 
 #undef CREATE_TRACE_POINTS
@@ -179,6 +183,152 @@ bad_bmap:
  * We may have stale swap cache pages in memory: notice
  * them here and get rid of the unnecessary final write.
  */
+/*
+ * kcompressd: kswapd hands the compression of anonymous pages going to a
+ * synchronous swap device (zram) over to a per-node thread, so it can keep
+ * scanning and reclaiming instead of compressing one page at a time.
+ *
+ * The folio stays locked in the swap cache until kcompressd writes it, so
+ * reclaim just finds it busy and comes back to it later. vm.kcompressd caps
+ * the queue depth; past it, or with it set to 0, kswapd compresses inline.
+ */
+#define KCOMPRESS_FIFO_SIZE	256
+
+struct kcompressd_node {
+	struct task_struct *task;
+	wait_queue_head_t wait;
+	spinlock_t lock;
+	DECLARE_KFIFO(fifo, struct folio *, KCOMPRESS_FIFO_SIZE);
+};
+
+static struct kcompressd_node kcompressd_nodes[MAX_NUMNODES];
+static int sysctl_kcompressd = 24;
+static int kcompress_fifo_size = KCOMPRESS_FIFO_SIZE;
+
+static bool kcompressd_store(struct folio *folio)
+{
+	struct kcompressd_node *kn = &kcompressd_nodes[folio_nid(folio)];
+	unsigned int depth = READ_ONCE(sysctl_kcompressd);
+	struct swap_info_struct *sis;
+	bool queued = false;
+
+	if (!depth || !current_is_kswapd() || !folio_test_anon(folio))
+		return false;
+
+	/* Pairs with smp_store_release() in kcompressd_run() */
+	if (!smp_load_acquire(&kn->task))
+		return false;
+
+	/* Only offload writes that would block kswapd */
+	sis = page_swap_info(&folio->page);
+	if ((data_race(sis->flags) & (SWP_FS_OPS | __SWP_WRITE_SYNCHRONOUS_IO)) !=
+	    __SWP_WRITE_SYNCHRONOUS_IO)
+		return false;
+
+	folio_get(folio);
+	spin_lock(&kn->lock);
+	if (kfifo_len(&kn->fifo) < depth)
+		queued = kfifo_put(&kn->fifo, folio);
+	spin_unlock(&kn->lock);
+
+	if (!queued) {
+		folio_put(folio);
+		return false;
+	}
+
+	wake_up_interruptible(&kn->wait);
+	return true;
+}
+
+static int kcompressd(void *p)
+{
+	struct kcompressd_node *kn = p;
+	struct writeback_control wbc = {
+		.sync_mode = WB_SYNC_NONE,
+		.nr_to_write = SWAP_CLUSTER_MAX,
+		.range_start = 0,
+		.range_end = LLONG_MAX,
+		.for_reclaim = 1,
+	};
+	struct folio *folio;
+	bool stop = false;
+
+	/* Same as kswapd: compression may allocate while freeing memory */
+	memalloc_noreclaim_save();
+
+	while (!stop) {
+		wait_event_interruptible(kn->wait,
+					 !kfifo_is_empty(&kn->fifo) ||
+					 kthread_should_stop());
+		stop = kthread_should_stop();
+
+		/* Always drain, also on the way out */
+		while (kfifo_out_spinlocked(&kn->fifo, &folio, 1, &kn->lock)) {
+			/* What pageout() would have set before writing */
+			folio_set_reclaim(folio);
+			__swap_writepage(&folio->page, &wbc);
+			folio_put(folio);
+			cond_resched();
+		}
+	}
+
+	return 0;
+}
+
+void __meminit kcompressd_run(int nid)
+{
+	struct kcompressd_node *kn = &kcompressd_nodes[nid];
+	struct task_struct *task;
+
+	if (kn->task)
+		return;
+
+	init_waitqueue_head(&kn->wait);
+	spin_lock_init(&kn->lock);
+	INIT_KFIFO(kn->fifo);
+
+	task = kthread_create_on_node(kcompressd, kn, nid, "kcompressd%d", nid);
+	if (IS_ERR(task)) {
+		pr_err("Failed to start kcompressd on node %d\n", nid);
+		return;
+	}
+
+	/* Pairs with smp_load_acquire() in kcompressd_store() */
+	smp_store_release(&kn->task, task);
+	wake_up_process(task);
+}
+
+void __meminit kcompressd_stop(int nid)
+{
+	struct kcompressd_node *kn = &kcompressd_nodes[nid];
+	struct task_struct *task = kn->task;
+
+	if (task) {
+		WRITE_ONCE(kn->task, NULL);
+		kthread_stop(task);
+	}
+}
+
+static struct ctl_table kcompressd_sysctl_table[] = {
+	{
+		.procname	= "kcompressd",
+		.data		= &sysctl_kcompressd,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= &kcompress_fifo_size,
+	},
+	{ }
+};
+
+static int __init kcompressd_sysctl_init(void)
+{
+	register_sysctl_init("vm", kcompressd_sysctl_table);
+	return 0;
+}
+late_initcall(kcompressd_sysctl_init);
+
 int swap_writepage(struct page *page, struct writeback_control *wbc)
 {
 	struct folio *folio = page_folio(page);
@@ -204,6 +354,8 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
 		folio_end_writeback(folio);
 		return 0;
 	}
+	if (kcompressd_store(folio))
+		return 0;
 	__swap_writepage(&folio->page, wbc);
 	return 0;
 }

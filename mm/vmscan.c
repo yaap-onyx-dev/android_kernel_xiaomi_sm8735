@@ -8349,6 +8349,8 @@ void __meminit kswapd_run(int nid)
 		}
 	}
 	pgdat_kswapd_unlock(pgdat);
+
+	kcompressd_run(nid);
 }
 
 /*
@@ -8367,6 +8369,8 @@ void __meminit kswapd_stop(int nid)
 		pgdat->kswapd = NULL;
 	}
 	pgdat_kswapd_unlock(pgdat);
+
+	kcompressd_stop(nid);
 }
 
 static int __init kswapd_init(void)
