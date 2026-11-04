@@ -5,6 +5,7 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/cpuhotplug.h>
 #include <linux/cpufreq.h>
 #include <linux/init.h>
 #include <linux/interconnect.h>
@@ -85,6 +86,19 @@ struct qcom_cpufreq_data {
 	unsigned long dcvsh_freq_limit;
 	struct device_attribute freq_limit_attr;
 };
+
+/*
+ * Where each CPU votes for its frequency, and the index of the domain's
+ * highest frequency, for setting the CPU to its maximum when it comes online.
+ */
+struct qcom_cpufreq_wake {
+	void __iomem *perf_state;
+	unsigned int max_index;
+	unsigned int max_freq;
+};
+
+static DEFINE_PER_CPU(struct qcom_cpufreq_wake, qcom_cpufreq_wake);
+static bool qcom_cpufreq_wake_registered;
 
 static unsigned long cpu_hw_rate, xo_rate;
 static bool icc_scaling_enabled;
@@ -698,8 +712,8 @@ static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
 	void __iomem *base;
 	struct qcom_cpufreq_data *data;
 	char pdmem_name[MAX_FN_SIZE] = {};
-	unsigned int max_freq;
-	int ret, index, i;
+	unsigned int max_freq, max_index;
+	int ret, index, i, cpu;
 
 	cpu_dev = get_cpu_device(policy->cpu);
 	if (!cpu_dev) {
@@ -804,12 +818,29 @@ static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
 	 * isn't set until after cpu_init returns.
 	 */
 	max_freq = 0;
+	max_index = 0;
 	for (i = 0; policy->freq_table[i].frequency != CPUFREQ_TABLE_END; i++) {
 		if (policy->freq_table[i].frequency != CPUFREQ_ENTRY_INVALID &&
-		    policy->freq_table[i].frequency > max_freq)
+		    policy->freq_table[i].frequency > max_freq) {
 			max_freq = policy->freq_table[i].frequency;
+			max_index = i;
+		}
 	}
 	fie_init_cpu_domain(policy->cpus, max_freq);
+
+	/* Record where each CPU of the domain votes, for qcom_cpufreq_wake_up() */
+	i = 0;
+	for_each_cpu(cpu, policy->cpus) {
+		struct qcom_cpufreq_wake *w = &per_cpu(qcom_cpufreq_wake, cpu);
+
+		w->max_index = max_index;
+		w->max_freq = max_freq;
+		/* Publish the register last, it marks the entry as valid */
+		smp_store_release(&w->perf_state,
+				  data->base + data->soc_data->reg_perf_state +
+				  (data->per_core_dcvs ? i * 4 : 0));
+		i++;
+	}
 
 	ret = dev_pm_opp_get_opp_count(cpu_dev);
 	if (ret <= 0) {
@@ -837,6 +868,10 @@ error:
 static int qcom_cpufreq_hw_cpu_exit(struct cpufreq_policy *policy)
 {
 	struct device *cpu_dev = get_cpu_device(policy->cpu);
+	int cpu;
+
+	for_each_cpu(cpu, policy->related_cpus)
+		WRITE_ONCE(per_cpu(qcom_cpufreq_wake, cpu).perf_state, NULL);
 
 	qcom_cpufreq_hw_lmh_exit(policy->driver_data);
 	dev_pm_opp_remove_all_dynamic(cpu_dev);
@@ -879,6 +914,27 @@ static struct cpufreq_driver cpufreq_qcom_hw_driver = {
 	.boost_enabled	= true,
 };
 
+/*
+ * Runs on a CPU that is coming online (CPUHP_AP_ONLINE, interrupts disabled),
+ * before the scheduler starts using it. Waking it up at its lowest frequency
+ * makes the first work it gets, which on resume from suspend is the resume
+ * path itself, run slower than it has to. The governor brings the frequency
+ * back down as soon as it gets to update it.
+ */
+static int qcom_cpufreq_wake_up(unsigned int cpu)
+{
+	struct qcom_cpufreq_wake *w = &per_cpu(qcom_cpufreq_wake, cpu);
+	void __iomem *perf_state = smp_load_acquire(&w->perf_state);
+
+	if (!perf_state)
+		return 0;
+
+	writel_relaxed(w->max_index, perf_state);
+	fie_rate_set(cpu, w->max_freq);
+
+	return 0;
+}
+
 static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
 {
 	struct device *cpu_dev;
@@ -914,16 +970,30 @@ static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
 		spin_lock_init(&qcom_cpufreq_counter[cpu].lock);
 
 	ret = cpufreq_register_driver(&cpufreq_qcom_hw_driver);
-	if (ret)
+	if (ret) {
 		dev_err(&pdev->dev, "CPUFreq HW driver failed to register\n");
-	else
-		dev_dbg(&pdev->dev, "QCOM CPUFreq HW driver initialized\n");
+		return ret;
+	}
 
-	return ret;
+	dev_dbg(&pdev->dev, "QCOM CPUFreq HW driver initialized\n");
+
+	/* Not fatal: CPUs just come online at whatever frequency they had */
+	if (cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE, "cpufreq/qcom-hw:wake",
+				      qcom_cpufreq_wake_up, NULL))
+		dev_warn(&pdev->dev, "Failed to set up the CPU online boost\n");
+	else
+		qcom_cpufreq_wake_registered = true;
+
+	return 0;
 }
 
 static void qcom_cpufreq_hw_driver_remove(struct platform_device *pdev)
 {
+	if (qcom_cpufreq_wake_registered) {
+		cpuhp_remove_state_nocalls(CPUHP_AP_ONLINE);
+		qcom_cpufreq_wake_registered = false;
+	}
+
 	cpufreq_unregister_driver(&cpufreq_qcom_hw_driver);
 }
 

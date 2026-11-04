@@ -2164,9 +2164,11 @@ static struct cpuhp_step cpuhp_hp_states[] = {
 
 	/* Entry state on starting. Interrupts enabled from here on. Transient
 	 * state for synchronsization */
+#if !IS_ENABLED(CONFIG_ARM_QCOM_CPUFREQ_HW)
 	[CPUHP_AP_ONLINE] = {
 		.name			= "ap:online",
 	},
+#endif
 	/*
 	 * Handled on control processor until the plugged processor manages
 	 * this itself.
