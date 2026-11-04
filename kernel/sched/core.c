@@ -2180,7 +2180,7 @@ static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 /*
  * Must only return false when DEQUEUE_SLEEP.
  */
-static inline bool dequeue_task(struct rq *rq, struct task_struct *p, int flags)
+bool dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 {
 	bool ret;
 

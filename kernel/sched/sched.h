@@ -2578,6 +2578,7 @@ static inline void __block_task(struct rq *rq, struct task_struct *p)
 }
 
 extern void activate_task(struct rq *rq, struct task_struct *p, int flags);
+extern bool dequeue_task(struct rq *rq, struct task_struct *p, int flags);
 extern void deactivate_task(struct rq *rq, struct task_struct *p, int flags);
 
 extern void check_preempt_curr(struct rq *rq, struct task_struct *p, int flags);
