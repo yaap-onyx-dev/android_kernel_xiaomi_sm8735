@@ -2007,7 +2007,6 @@ static inline const struct cpumask *task_user_cpus(struct task_struct *p)
 }
 #endif /* CONFIG_SMP */
 
-#include "stats.h"
 
 #if defined(CONFIG_SCHED_CORE) && defined(CONFIG_SCHEDSTATS)
 
@@ -2991,6 +2990,8 @@ extern void nohz_run_idle_balance(int cpu);
 #else
 static inline void nohz_run_idle_balance(int cpu) { }
 #endif
+
+#include "stats.h"
 
 #ifdef CONFIG_IRQ_TIME_ACCOUNTING
 struct irqtime {
