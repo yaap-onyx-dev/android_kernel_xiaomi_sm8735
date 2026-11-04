@@ -138,7 +138,8 @@ static __always_inline void exit_to_user_mode_prepare(struct pt_regs *regs)
 
 	flags = read_thread_flags();
 	trace_android_vh_restore_curr_resched(&flags, &thread_lazy_resched_flag);
-	if (unlikely(flags & _TIF_WORK_MASK) || thread_lazy_resched_flag)
+	if (unlikely(flags & (_TIF_WORK_MASK | _TIF_LAZY_RESCHED)) ||
+	    thread_lazy_resched_flag)
 		do_notify_resume(regs, flags);
 
 	lockdep_sys_exit();

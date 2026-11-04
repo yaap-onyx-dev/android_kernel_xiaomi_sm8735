@@ -5881,6 +5881,9 @@ void scheduler_tick(void)
 	thermal_pressure = arch_scale_thermal_pressure(cpu_of(rq));
 	update_thermal_load_avg(rq_clock_thermal(rq), rq, thermal_pressure);
 	curr->sched_class->task_tick(rq, curr, 0);
+	/* Don't let a lazy reschedule wait for more than a tick */
+	if (test_tsk_lazy_resched(curr))
+		resched_curr(rq);
 	if (sched_feat(LATENCY_WARN))
 		resched_latency = cpu_resched_latency(rq);
 	calc_global_load_tick(rq);
@@ -6892,6 +6895,7 @@ static void __sched notrace __schedule(unsigned int sched_mode)
 
 	next = pick_next_task(rq, prev, &rf);
 	clear_tsk_need_resched(prev);
+	clear_tsk_lazy_resched(prev);
 	clear_preempt_need_resched();
 	trace_android_vh_clear_curr_lazy(prev);
 #ifdef CONFIG_SCHED_DEBUG

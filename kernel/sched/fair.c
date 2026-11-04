@@ -60,6 +60,8 @@
 #include <trace/hooks/sched.h>
 #include <trace/hooks/dtask.h>
 
+#include <linux/cpu_boost.h>
+
 EXPORT_TRACEPOINT_SYMBOL_GPL(sched_stat_runtime);
 
 /*
@@ -8945,6 +8947,45 @@ static void set_next_buddy(struct sched_entity *se)
 	}
 }
 
+/*
+ * Tasks the user is waiting on: the foreground app (oom_score_adj 0) and the
+ * system processes and native daemons below it, such as SurfaceFlinger and
+ * system_server. Kernel threads and background apps aren't.
+ */
+static __always_inline bool task_latency_critical(struct task_struct *p)
+{
+	struct signal_struct *sig;
+
+	if (p->flags & PF_KTHREAD)
+		return false;
+
+	sig = READ_ONCE(p->signal);
+	if (unlikely(!sig))
+		return false;
+
+	return READ_ONCE(sig->oom_score_adj) <= 0;
+}
+
+/*
+ * Don't let a wakeup of a task nobody is waiting on interrupt a latency
+ * critical task in the middle of its work: reschedule it lazily instead, on
+ * its next return to user space. The tick still preempts it once its slice
+ * runs out. App launch boosts turn this off, so everything the launch wakes
+ * gets the CPU right away.
+ */
+static __always_inline bool wakeup_preempt_lazy(struct rq *rq, struct task_struct *p)
+{
+	struct task_struct *curr = rq->curr;
+
+	if (!sched_feat(LAZY_WAKEUP_PREEMPT))
+		return false;
+
+	if (!task_latency_critical(curr) || task_latency_critical(p))
+		return false;
+
+	return !cpu_boost_max_active();
+}
+
 enum preempt_wakeup_action {
 	PREEMPT_WAKEUP_NONE,	/* No preemption. */
 	PREEMPT_WAKEUP_SHORT,	/* Ignore slice protection. */
@@ -9177,6 +9218,11 @@ preempt:
 
 	if (ignore)
 		return;
+
+	if (!cse_is_idle && wakeup_preempt_lazy(rq, p)) {
+		set_tsk_lazy_resched(curr);
+		return;
+	}
 
 	cancel_protect_slice(se);
 

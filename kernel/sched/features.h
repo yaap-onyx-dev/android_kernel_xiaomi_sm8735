@@ -64,6 +64,11 @@ SCHED_FEAT(PARANOID_AVG, false)
  * Allow wakeup-time preemption of the current task:
  */
 SCHED_FEAT(WAKEUP_PREEMPTION, true)
+/*
+ * Reschedule latency critical tasks lazily, on return to user space, when a
+ * background task wakes up.
+ */
+SCHED_FEAT(LAZY_WAKEUP_PREEMPT, true)
 
 SCHED_FEAT(HRTICK, false)
 SCHED_FEAT(HRTICK_DL, false)

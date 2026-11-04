@@ -2109,6 +2109,42 @@ static inline int test_tsk_need_resched(struct task_struct *tsk)
 }
 
 /*
+ * A lazy reschedule only takes effect when the task returns to user space.
+ * Fair class wakeups use it to avoid preempting latency critical tasks in
+ * the middle of their work.
+ */
+#ifdef TIF_LAZY_RESCHED
+static inline void set_tsk_lazy_resched(struct task_struct *tsk)
+{
+	set_tsk_thread_flag(tsk, TIF_LAZY_RESCHED);
+}
+
+static inline void clear_tsk_lazy_resched(struct task_struct *tsk)
+{
+	clear_tsk_thread_flag(tsk, TIF_LAZY_RESCHED);
+}
+
+static inline int test_tsk_lazy_resched(struct task_struct *tsk)
+{
+	return unlikely(test_tsk_thread_flag(tsk, TIF_LAZY_RESCHED));
+}
+#else
+static inline void set_tsk_lazy_resched(struct task_struct *tsk)
+{
+	set_tsk_need_resched(tsk);
+}
+
+static inline void clear_tsk_lazy_resched(struct task_struct *tsk)
+{
+}
+
+static inline int test_tsk_lazy_resched(struct task_struct *tsk)
+{
+	return 0;
+}
+#endif
+
+/*
  * cond_resched() and cond_resched_lock(): latency reduction via
  * explicit rescheduling in places that are safe. The return
  * value indicates whether a reschedule was done in fact.
