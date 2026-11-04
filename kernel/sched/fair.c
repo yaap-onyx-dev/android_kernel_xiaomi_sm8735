@@ -1229,14 +1229,6 @@ static void update_tg_load_avg(struct cfs_rq *cfs_rq)
 }
 #endif /* CONFIG_SMP */
 
-static inline bool resched_next_slice(struct cfs_rq *cfs_rq, struct sched_entity *curr)
-{
-	if (protect_slice(curr))
-		return false;
-
-	return !entity_eligible(cfs_rq, curr);
-}
-
 /*
  * Update the current task's runtime statistics.
  */
@@ -1285,7 +1277,7 @@ static void update_curr(struct cfs_rq *cfs_rq)
 	if (cfs_rq->nr_queued == 1)
 		return;
 
-	if (resched || resched_next_slice(cfs_rq, curr)) {
+	if (resched || !protect_slice(curr)) {
 		bool skip_preempt = false;
 
 		trace_android_vh_resched_curr_lazy(rq, &skip_preempt);
