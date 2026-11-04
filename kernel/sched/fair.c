@@ -8999,21 +8999,13 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	cse_is_idle = se_is_idle(se);
 	pse_is_idle = se_is_idle(pse);
 
+	nse = se;
 	/*
 	 * Preempt an idle entity in favor of a non-idle entity (and don't preempt
 	 * in the inverse case).
 	 */
-	if (cse_is_idle && !pse_is_idle) {
-		/*
-		 * When non-idle entity preempt an idle entity,
-		 * don't give idle entity slice protection.
-		 */
-		preempt_action = PREEMPT_WAKEUP_SHORT;
+	if (cse_is_idle && !pse_is_idle)
 		goto preempt;
-	}
-
-	if (cse_is_idle != pse_is_idle)
-		return;
 
 	/*
 	 * BATCH and IDLE tasks do not preempt others.
@@ -9024,12 +9016,22 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 	cfs_rq = cfs_rq_of(se);
 	update_curr(cfs_rq);
 
+	if (cse_is_idle != pse_is_idle)
+		goto update;
+
 	trace_android_rvh_check_preempt_wakeup(rq, p, &preempt, &ignore,
 				wake_flags, se, pse, next_buddy_marked);
 	if (preempt)
 		goto preempt;
 	if (ignore)
 		return;
+
+	/*
+	 * Do not preempt for tasks that are sched_delayed as it would violate
+	 * EEVDF to forcibly queue an ineligible task.
+	 */
+	if (pse->sched_delayed)
+		goto update;
 
 	/*
 	 * If @p has a shorter slice than current and @p is eligible, override
@@ -9042,12 +9044,10 @@ static void check_preempt_wakeup(struct rq *rq, struct task_struct *p, int wake_
 
 	/*
 	 * Ignore wakee preemption on WF_FORK as it is less likely that
-	 * there is shared data as exec often follow fork. Do not
-	 * preempt for tasks that are sched_delayed as it would violate
-	 * EEVDF to forcibly queue an ineligible task.
+	 * there is shared data as exec often follow fork.
 	 */
-	if ((wake_flags & WF_FORK) || pse->sched_delayed)
-		return;
+	if (wake_flags & WF_FORK)
+		goto update;
 
 	/* Prefer picking wakee soon if appropriate. */
 	if (sched_feat(NEXT_BUDDY) && set_preempt_buddy(cfs_rq, pse)) {
@@ -9085,6 +9085,13 @@ pick:
 	if (!nse && cfs_rq->nr_queued)
 		goto pick;
 
+	/*
+	 * If @p is eligible but not the next task to run then cancel protection
+	 * to prevent large scheduling latency
+	 */
+	if (preempt_action == PREEMPT_WAKEUP_SHORT && entity_eligible(cfs_rq, pse))
+		goto preempt;
+update:
 	if (sched_feat(RUN_TO_PARITY))
 		update_protect_slice(cfs_rq, se);
 
@@ -9096,10 +9103,10 @@ preempt:
 	if (ignore)
 		return;
 
-	if (preempt_action == PREEMPT_WAKEUP_SHORT) {
-		cancel_protect_slice(se);
+	cancel_protect_slice(se);
+
+	if (preempt_action == PREEMPT_WAKEUP_SHORT)
 		set_short_buddy(cfs_rq, pse);
-	}
 
 	resched_curr(rq);
 }
