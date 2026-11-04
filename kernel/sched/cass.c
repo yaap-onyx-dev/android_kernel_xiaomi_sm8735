@@ -258,10 +258,12 @@ static int cass_best_cpu(struct task_struct *p, int prev_cpu, bool sync, bool rt
 		/*
 		 * Check if this CPU is idle or only has SCHED_IDLE tasks. For
 		 * sync wakes, treat the current CPU as idle if @current is the
-		 * only running task.
+		 * only running task. Tasks waiting on a delayed dequeue don't
+		 * count, they won't run again until they're woken up.
 		 */
 		curr->cpu = cpu;
-		if ((sync && cpu == this_cpu && rq->nr_running == 1) ||
+		if ((sync && cpu == this_cpu &&
+		     rq->nr_running - cfs_h_nr_delayed(rq) == 1) ||
 		    cass_choose_idle_cpu(cpu, p)) {
 			/*
 			 * A non-idle candidate may be better for energy
